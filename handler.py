@@ -1,316 +1,262 @@
 """
 ACE-Step 1.5 RunPod Serverless Handler
-Based on valyriantech/ace-step-1.5:latest image
+Properly handles flash_attn incompatibility by patching at the Python import level.
 """
 
 import os
 import sys
-from types import ModuleType
-from unittest.mock import MagicMock
-import importlib.abc
-import importlib.machinery
 
-# CRITICAL: Set environment variables BEFORE importing anything else
-os.environ['ATTN_BACKEND'] = 'sdpa'
-os.environ['USE_FLASH_ATTN'] = '0'
-os.environ['DIFFUSERS_ATTN_IMPLEMENTATION'] = 'sdpa'
-os.environ['TORCH_SDPA_ENABLED'] = '1'
+# =============================================================================
+# STEP 1: PATCH FLASH_ATTN BEFORE ANY OTHER IMPORTS
+# This MUST be the very first thing that happens
+# =============================================================================
 
-# ============================================================
-# BLOCK FLASH_ATTN AT THE IMPORT SYSTEM LEVEL
-# ============================================================
-
-class FlashAttnBlocker(importlib.abc.MetaPathFinder, importlib.abc.Loader):
-    """Intercept any attempt to import flash_attn and return a fake module"""
+def _create_fake_flash_attn_class():
+    from types import ModuleType
     
-    BLOCKED_MODULES = frozenset([
-        'flash_attn',
-        'flash_attn_2_cuda', 
-        'flash_attn.flash_attn_interface',
-        'flash_attn.flash_attn_triton',
-        'flash_attn.bert_padding',
-        'flash_attn.flash_blocksparse_attention',
-    ])
+    class FakeFlashAttnModule(ModuleType):
+        def __init__(self, name):
+            super().__init__(name)
+            self.__version__ = "0.0.0"
+            self.__file__ = __file__
+            self.__path__ = []
+            self.__all__ = []
+            
+        def __getattr__(self, name):
+            def _not_available(*args, **kwargs):
+                raise ImportError(f"flash_attn.{name} is not available")
+            return _not_available
     
-    def find_module(self, fullname, path=None):
-        if fullname in self.BLOCKED_MODULES or fullname.startswith('flash_attn'):
-            return self
-        return None
+    return FakeFlashAttnModule
+
+def patch_flash_attn():
+    FakeModule = _create_fake_flash_attn_class()
     
-    def find_spec(self, fullname, path, target=None):
-        if fullname in self.BLOCKED_MODULES or fullname.startswith('flash_attn'):
-            return importlib.machinery.ModuleSpec(fullname, self)
-        return None
+    modules_to_fake = [
+        "flash_attn", "flash_attn_2_cuda",
+        "flash_attn.flash_attn_interface", "flash_attn.flash_attn_triton",
+        "flash_attn.bert_padding", "flash_attn.flash_blocksparse_attention",
+        "flash_attn.layers", "flash_attn.layers.patch_embed",
+        "flash_attn.layers.rotary", "flash_attn.ops", "flash_attn.ops.triton",
+        "flash_attn.modules", "flash_attn.modules.mha",
+    ]
     
-    def load_module(self, fullname):
-        if fullname in sys.modules:
-            return sys.modules[fullname]
-        
-        # Create a fake module with MagicMock attributes
-        fake = MagicMock()
-        fake.__name__ = fullname
-        fake.__loader__ = self
-        fake.__package__ = fullname.rsplit('.', 1)[0] if '.' in fullname else fullname
-        fake.__path__ = []
-        fake.__file__ = None
-        
-        # Make sure common functions exist but raise when called
-        def _disabled(*args, **kwargs):
-            raise ImportError(f"{fullname} is disabled - using SDPA fallback")
-        
-        fake.flash_attn_func = _disabled
-        fake.flash_attn_varlen_func = _disabled
-        fake.flash_attn_qkvpacked_func = _disabled
-        
-        sys.modules[fullname] = fake
-        return fake
+    for mod_name in modules_to_fake:
+        if mod_name not in sys.modules:
+            fake = FakeModule(mod_name)
+            def _raise_import(*a, **k):
+                raise ImportError("flash_attn disabled")
+            fake.flash_attn_func = _raise_import
+            fake.flash_attn_varlen_func = _raise_import
+            fake.flash_attn_qkvpacked_func = _raise_import
+            fake.flash_attn_kvpacked_func = _raise_import
+            sys.modules[mod_name] = fake
     
-    def create_module(self, spec):
-        return None
-    
-    def exec_module(self, module):
-        pass
+    print("[handler.py] flash_attn modules patched")
 
-# Install the blocker as the FIRST meta path finder
-# This ensures it intercepts flash_attn before Python searches the filesystem
-sys.meta_path.insert(0, FlashAttnBlocker())
+# Apply the patch IMMEDIATELY
+patch_flash_attn()
 
-# Also pre-populate sys.modules to prevent any race conditions
-for mod_name in FlashAttnBlocker.BLOCKED_MODULES:
-    if mod_name not in sys.modules:
-        fake = MagicMock()
-        fake.__name__ = mod_name
-        sys.modules[mod_name] = fake
+# Set environment variables
+os.environ["ATTN_BACKEND"] = "sdpa"
+os.environ["USE_FLASH_ATTN"] = "0"
+os.environ["FLASH_ATTENTION_SKIP_CUDA_BUILD"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["PYTHONUNBUFFERED"] = "1"
 
-# Block xformers too if needed
-sys.modules['xformers'] = MagicMock()
-sys.modules['xformers.ops'] = MagicMock()
-
-print("[handler.py] Flash-attn blocker installed, using SDPA fallback")
-
+# Now safe to import other modules
 import runpod
 import base64
 import tempfile
 import traceback
-import subprocess
-import glob
+import time
 
-# Global state
-is_initialized = False
-ace_step_module = None
+print("[handler.py] Starting ACE-Step 1.5 RunPod Serverless Handler")
+print(f"[handler.py] Python: {sys.version}")
 
-def find_ace_step():
-    """Find ACE-Step installation in the container"""
-    possible_paths = [
-        '/app',
-        '/app/ace-step',
-        '/app/ACE-Step-1.5',
-        '/workspace',
-        '/opt/ace-step',
-    ]
-    
-    for path in possible_paths:
-        if os.path.exists(path):
-            # Look for key files
-            for root, dirs, files in os.walk(path):
-                if 'inference.py' in files or 'generate.py' in files:
-                    print(f"Found ACE-Step at: {root}")
-                    return root
-                if 'acestep' in dirs:
-                    print(f"Found acestep module at: {path}")
-                    return path
-    
-    return None
+# Global state - initialized lazily
+_handler = None
+_llm_handler = None
+_initialized = False
 
-def load_models():
-    """Load ACE-Step models - auto-discover module structure"""
-    global is_initialized, ace_step_module
+def get_handlers():
+    global _handler, _llm_handler, _initialized
     
-    if is_initialized:
-        return True
+    if _initialized:
+        return _handler, _llm_handler
     
-    print("Discovering ACE-Step installation...")
-    
-    # Find ace-step path
-    ace_path = find_ace_step()
-    if ace_path:
-        sys.path.insert(0, ace_path)
-        print(f"Added {ace_path} to Python path")
-    
-    # Try different import patterns
-    try:
-        # Pattern 1: acestep.pipeline (common structure)
-        from acestep.pipeline import ACEStepPipeline
-        print("✓ Found acestep.pipeline.ACEStepPipeline")
-        ace_step_module = "pipeline"
-        is_initialized = True
-        return True
-    except ImportError as e:
-        print(f"Pipeline import failed: {e}")
+    print("[handler.py] Initializing ACE-Step handlers...")
     
     try:
-        # Pattern 2: acestep.inference
-        from acestep import inference
-        print("✓ Found acestep.inference")
-        ace_step_module = "inference"
-        is_initialized = True
-        return True
-    except ImportError as e:
-        print(f"Inference import failed: {e}")
-    
-    try:
-        # Pattern 3: Direct import
-        import acestep
-        print(f"✓ Found acestep: {dir(acestep)}")
-        ace_step_module = "acestep"
-        is_initialized = True
-        return True
-    except ImportError as e:
-        print(f"acestep import failed: {e}")
-    
-    # Pattern 4: Check for CLI script
-    cli_paths = glob.glob('/app/**/generate*.py', recursive=True)
-    if cli_paths:
-        print(f"Found CLI scripts: {cli_paths}")
-        ace_step_module = "cli"
-        is_initialized = True
-        return True
-    
-    print("❌ Could not find ACE-Step module")
-    return False
-
-
-def generate_with_cli(caption, lyrics, duration, output_path, **kwargs):
-    """Generate music using CLI if available"""
-    cli_script = glob.glob('/app/**/generate*.py', recursive=True)
-    if not cli_script:
-        raise Exception("No CLI script found")
-    
-    cmd = [
-        'python', cli_script[0],
-        '--caption', caption,
-        '--lyrics', lyrics,
-        '--duration', str(duration),
-        '--output', output_path
-    ]
-    
-    if kwargs.get('bpm'):
-        cmd.extend(['--bpm', str(kwargs['bpm'])])
-    if kwargs.get('seed') and kwargs['seed'] != -1:
-        cmd.extend(['--seed', str(kwargs['seed'])])
-    
-    print(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    
-    if result.returncode != 0:
-        raise Exception(f"CLI failed: {result.stderr}")
-    
-    return output_path
-
-
-def generate_with_pipeline(caption, lyrics, duration, output_path, **kwargs):
-    """Generate music using ACEStepPipeline"""
-    from acestep.pipeline import ACEStepPipeline
-    
-    pipeline = ACEStepPipeline.from_pretrained(
-        "/app/checkpoints" if os.path.exists("/app/checkpoints") else "ACE-Step/ACE-Step-v1.5"
-    )
-    pipeline = pipeline.to("cuda")
-    
-    audio = pipeline(
-        prompt=caption,
-        lyrics=lyrics,
-        duration=duration,
-        num_inference_steps=kwargs.get('inference_steps', 8),
-    )
-    
-    # Save audio
-    import soundfile as sf
-    sf.write(output_path, audio.squeeze().cpu().numpy(), 44100)
-    
-    return output_path
-
-
-def handler(job):
-    """RunPod serverless handler"""
-    try:
-        job_input = job["input"]
+        ace_step_path = "/app/ace-step"
+        if os.path.exists(ace_step_path) and ace_step_path not in sys.path:
+            sys.path.insert(0, ace_step_path)
+            print(f"[handler.py] Added {ace_step_path} to Python path")
         
-        caption = job_input.get("caption") or job_input.get("tags", "pop, upbeat, energetic")
-        lyrics = job_input.get("lyrics", "[instrumental]")
-        duration = min(600, max(10, int(job_input.get("duration", 120))))
-        audio_format = job_input.get("audio_format", "mp3")
+        if os.path.exists("/app"):
+            print(f"[handler.py] Contents of /app: {os.listdir('/app')}")
         
-        kwargs = {
-            'bpm': job_input.get('bpm'),
-            'seed': job_input.get('seed', -1),
-            'inference_steps': job_input.get('inference_steps', 8),
-            'thinking': job_input.get('thinking', True),
-        }
+        from acestep.handler import AceStepHandler
+        print("[handler.py] Successfully imported AceStepHandler")
         
-        print(f"🎵 Generating: duration={duration}s, format={audio_format}")
-        print(f"   Caption: {caption[:100]}...")
+        _handler = AceStepHandler()
         
-        # Load models
-        if not load_models():
-            raise Exception("Failed to load ACE-Step models")
+        project_root = "/app/ace-step"
+        config_path = os.environ.get("ACESTEP_CONFIG_PATH", "acestep-v15-turbo")
         
-        # Create temp output
-        output_dir = tempfile.mkdtemp(prefix="acestep_")
-        output_path = os.path.join(output_dir, f"output.{audio_format}")
+        print(f"[handler.py] Initializing DiT model: {config_path}")
+        status_msg, success = _handler.initialize_service(
+            project_root=project_root,
+            config_path=config_path,
+            device="cuda",
+            use_flash_attention=False,
+            compile_model=False,
+            offload_to_cpu=False,
+        )
+        
+        if not success:
+            raise RuntimeError(f"Failed to initialize DiT model: {status_msg}")
+        
+        print(f"[handler.py] DiT model initialized: {status_msg}")
         
         try:
-            # Generate based on discovered module
-            if ace_step_module == "pipeline":
-                generate_with_pipeline(caption, lyrics, duration, output_path, **kwargs)
-            elif ace_step_module == "cli":
-                generate_with_cli(caption, lyrics, duration, output_path, **kwargs)
-            else:
-                # Try pipeline first, then CLI
-                try:
-                    generate_with_pipeline(caption, lyrics, duration, output_path, **kwargs)
-                except Exception as e:
-                    print(f"Pipeline failed, trying CLI: {e}")
-                    generate_with_cli(caption, lyrics, duration, output_path, **kwargs)
+            from acestep.llm_inference import LLMHandler
+            lm_model_path = os.environ.get("ACESTEP_LM_MODEL_PATH", "acestep-5Hz-lm-1.7B")
             
-            # Check if file was created
-            if not os.path.exists(output_path):
-                # Try wav extension
-                output_path = os.path.join(output_dir, "output.wav")
-                if not os.path.exists(output_path):
-                    raise Exception(f"Output file not created")
-            
-            # Read and encode
-            with open(output_path, "rb") as f:
-                audio_base64 = base64.b64encode(f.read()).decode("utf-8")
-            
-            print(f"✅ Generated {os.path.getsize(output_path)} bytes")
-            
-            return {
-                "audio_base64": audio_base64,
-                "duration": duration,
-                "seed": kwargs.get('seed', -1),
-                "model": "ace-step-1.5",
-                "format": audio_format
-            }
-            
-        finally:
-            # Cleanup
-            try:
-                import shutil
-                shutil.rmtree(output_dir)
-            except:
-                pass
-                
+            _llm_handler = LLMHandler()
+            llm_status = _llm_handler.initialize_llm(
+                project_root=project_root,
+                lm_model_path=lm_model_path,
+            )
+            print(f"[handler.py] LLM initialized: {llm_status}")
+        except Exception as e:
+            print(f"[handler.py] LLM initialization skipped: {e}")
+            _llm_handler = None
+        
+        _initialized = True
+        print("[handler.py] Handlers initialized successfully")
+        return _handler, _llm_handler
+        
     except Exception as e:
+        print(f"[handler.py] ERROR initializing handlers: {e}")
         traceback.print_exc()
-        return {"error": str(e)}
+        raise
 
+def handler(job):
+    start_time = time.time()
+    
+    try:
+        job_input = job.get("input", {})
+        
+        caption = job_input.get("caption") or job_input.get("tags", "")
+        lyrics = job_input.get("lyrics", "[instrumental]")
+        duration = job_input.get("duration", 60)
+        bpm = job_input.get("bpm")
+        key_scale = job_input.get("key_scale", "")
+        time_signature = job_input.get("time_signature", "")
+        vocal_language = job_input.get("vocal_language", "en")
+        thinking = job_input.get("thinking", True)
+        inference_steps = job_input.get("inference_steps", 8)
+        guidance_scale = job_input.get("guidance_scale", 7.0)
+        seed = job_input.get("seed", -1)
+        audio_format = job_input.get("audio_format", "mp3")
+        
+        duration = max(10, min(600, int(duration)))
+        
+        print(f"[handler] Generating music:")
+        print(f"  Caption: {caption[:100]}..." if len(caption) > 100 else f"  Caption: {caption}")
+        print(f"  Duration: {duration}s, Thinking: {thinking}")
+        
+        dit_handler, llm_handler = get_handlers()
+        
+        from acestep.inference import generate_music, GenerationParams, GenerationConfig
+        
+        params = GenerationParams(
+            caption=caption,
+            lyrics=lyrics,
+            duration=float(duration),
+            bpm=bpm,
+            keyscale=key_scale,
+            timesignature=time_signature,
+            vocal_language=vocal_language,
+            thinking=thinking and llm_handler is not None,
+            inference_steps=inference_steps,
+            guidance_scale=guidance_scale,
+            seed=seed if seed != -1 else -1,
+        )
+        
+        config = GenerationConfig(
+            batch_size=1,
+            use_random_seed=(seed == -1),
+            audio_format=audio_format,
+        )
+        
+        output_dir = tempfile.mkdtemp(prefix="acestep_")
+        
+        result = generate_music(
+            dit_handler=dit_handler,
+            llm_handler=llm_handler if thinking else None,
+            params=params,
+            config=config,
+            save_dir=output_dir,
+        )
+        
+        if not result.success:
+            raise RuntimeError(f"Generation failed: {result.error}")
+        
+        if not result.audios:
+            raise RuntimeError("No audio generated")
+        
+        audio_info = result.audios[0]
+        audio_path = audio_info.get("path")
+        
+        if not audio_path or not os.path.exists(audio_path):
+            audio_tensor = audio_info.get("tensor")
+            if audio_tensor is not None:
+                import torchaudio
+                audio_path = os.path.join(output_dir, f"output.{audio_format}")
+                sample_rate = audio_info.get("sample_rate", 48000)
+                torchaudio.save(audio_path, audio_tensor, sample_rate)
+        
+        if not audio_path or not os.path.exists(audio_path):
+            raise RuntimeError("Audio file not created")
+        
+        with open(audio_path, "rb") as f:
+            audio_base64 = base64.b64encode(f.read()).decode("utf-8")
+        
+        generation_time = time.time() - start_time
+        file_size = os.path.getsize(audio_path)
+        
+        print(f"[handler] Generated {file_size} bytes in {generation_time:.2f}s")
+        
+        try:
+            import shutil
+            shutil.rmtree(output_dir)
+        except:
+            pass
+        
+        return {
+            "audio_base64": audio_base64,
+            "duration": duration,
+            "seed": audio_info.get("params", {}).get("seed", seed),
+            "model": "ace-step-1.5",
+            "format": audio_format,
+            "generation_time": round(generation_time, 2),
+        }
+        
+    except Exception as e:
+        error_msg = str(e)
+        print(f"[handler] ERROR: {error_msg}")
+        traceback.print_exc()
+        return {"error": error_msg}
 
-# Start RunPod serverless worker
 if __name__ == "__main__":
-    print("Starting ACE-Step 1.5 RunPod Serverless Worker...")
-    print(f"Python path: {sys.path}")
-    print(f"Working directory: {os.getcwd()}")
-    print(f"Contents of /app: {os.listdir('/app') if os.path.exists('/app') else 'N/A'}")
+    print("[handler.py] Starting RunPod serverless worker...")
+    
+    try:
+        get_handlers()
+        print("[handler.py] Pre-initialization complete")
+    except Exception as e:
+        print(f"[handler.py] Pre-initialization failed (will retry on first request): {e}")
+    
     runpod.serverless.start({"handler": handler})
