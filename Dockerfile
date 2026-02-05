@@ -31,18 +31,14 @@ RUN uv pip install --system packaging wheel setuptools ninja
 RUN uv pip install --system --no-build-isolation -r requirements.txt
 
 # Install additional dependencies for RunPod
-RUN uv pip install --system runpod boto3
+RUN uv pip install --system runpod boto3 huggingface_hub
 
 # Install vllm for fast LLM inference (used by LLMHandler)
 RUN uv pip install --system vllm
 
-# Download models during build for faster cold starts
-# This downloads both DiT (acestep-v15-turbo) and LM (acestep-5Hz-lm-1.7B) models
-RUN uv pip install --system huggingface_hub
-RUN python -c "\
-from huggingface_hub import snapshot_download; \
-snapshot_download('ACE-Step/ACE-Step-v1.5', local_dir='./checkpoints', ignore_patterns=['*.md', '*.txt']); \
-print('Models downloaded successfully')"
+# Models will be downloaded at runtime on first request
+# This avoids build-time HuggingFace auth issues
+# They'll be cached in the container for subsequent requests
 
 # Copy our handler
 COPY handler.py /app/handler.py
