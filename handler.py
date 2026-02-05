@@ -5,18 +5,88 @@ Based on valyriantech/ace-step-1.5:latest image
 
 import os
 import sys
+from types import ModuleType
+from unittest.mock import MagicMock
+import importlib.abc
+import importlib.machinery
 
 # CRITICAL: Set environment variables BEFORE importing anything else
-# This disables flash-attn and uses PyTorch's SDPA instead
 os.environ['ATTN_BACKEND'] = 'sdpa'
 os.environ['USE_FLASH_ATTN'] = '0'
 os.environ['DIFFUSERS_ATTN_IMPLEMENTATION'] = 'sdpa'
 os.environ['TORCH_SDPA_ENABLED'] = '1'
 
-# Block flash_attn from being imported
-sys.modules['flash_attn'] = None
-sys.modules['flash_attn_2_cuda'] = None
-sys.modules['flash_attn.flash_attn_interface'] = None
+# ============================================================
+# BLOCK FLASH_ATTN AT THE IMPORT SYSTEM LEVEL
+# ============================================================
+
+class FlashAttnBlocker(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Intercept any attempt to import flash_attn and return a fake module"""
+    
+    BLOCKED_MODULES = frozenset([
+        'flash_attn',
+        'flash_attn_2_cuda', 
+        'flash_attn.flash_attn_interface',
+        'flash_attn.flash_attn_triton',
+        'flash_attn.bert_padding',
+        'flash_attn.flash_blocksparse_attention',
+    ])
+    
+    def find_module(self, fullname, path=None):
+        if fullname in self.BLOCKED_MODULES or fullname.startswith('flash_attn'):
+            return self
+        return None
+    
+    def find_spec(self, fullname, path, target=None):
+        if fullname in self.BLOCKED_MODULES or fullname.startswith('flash_attn'):
+            return importlib.machinery.ModuleSpec(fullname, self)
+        return None
+    
+    def load_module(self, fullname):
+        if fullname in sys.modules:
+            return sys.modules[fullname]
+        
+        # Create a fake module with MagicMock attributes
+        fake = MagicMock()
+        fake.__name__ = fullname
+        fake.__loader__ = self
+        fake.__package__ = fullname.rsplit('.', 1)[0] if '.' in fullname else fullname
+        fake.__path__ = []
+        fake.__file__ = None
+        
+        # Make sure common functions exist but raise when called
+        def _disabled(*args, **kwargs):
+            raise ImportError(f"{fullname} is disabled - using SDPA fallback")
+        
+        fake.flash_attn_func = _disabled
+        fake.flash_attn_varlen_func = _disabled
+        fake.flash_attn_qkvpacked_func = _disabled
+        
+        sys.modules[fullname] = fake
+        return fake
+    
+    def create_module(self, spec):
+        return None
+    
+    def exec_module(self, module):
+        pass
+
+# Install the blocker as the FIRST meta path finder
+# This ensures it intercepts flash_attn before Python searches the filesystem
+sys.meta_path.insert(0, FlashAttnBlocker())
+
+# Also pre-populate sys.modules to prevent any race conditions
+for mod_name in FlashAttnBlocker.BLOCKED_MODULES:
+    if mod_name not in sys.modules:
+        fake = MagicMock()
+        fake.__name__ = mod_name
+        sys.modules[mod_name] = fake
+
+# Block xformers too if needed
+sys.modules['xformers'] = MagicMock()
+sys.modules['xformers.ops'] = MagicMock()
+
+print("[handler.py] Flash-attn blocker installed, using SDPA fallback")
 
 import runpod
 import base64
