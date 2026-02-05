@@ -1,55 +1,18 @@
 # ACE-Step 1.5 RunPod Serverless Worker
-# Docker Hub: mayo12/ace-step-1.5-runpod
-FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
+# Use valyriantech's pre-built image (has all deps + models working)
+FROM valyriantech/ace-step-1.5:latest
 
-WORKDIR /app
+# Install RunPod SDK
+RUN pip install --no-cache-dir runpod
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    git \
-    git-lfs \
-    ffmpeg \
-    libsndfile1 \
-    curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && git lfs install
-
-# Install uv for faster package management
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
-ENV PATH="/root/.local/bin:$PATH"
-
-# Clone ACE-Step 1.5 repository
-RUN git clone https://github.com/ACE-Step/ACE-Step-1.5.git /app/ace-step
-
-WORKDIR /app/ace-step
-
-# Install packaging first (required for flash-attn build)
-RUN uv pip install --system packaging wheel setuptools ninja
-
-# Install ACE-Step dependencies (flash-attn may take a while to compile)
-# Use --no-build-isolation so flash-attn can find packaging module
-RUN uv pip install --system --no-build-isolation -r requirements.txt
-
-# Install additional dependencies for RunPod
-RUN uv pip install --system runpod boto3 huggingface_hub
-
-# Install vllm for fast LLM inference (used by LLMHandler)
-RUN uv pip install --system vllm
-
-# Models will be downloaded at runtime on first request
-# This avoids build-time HuggingFace auth issues
-# They'll be cached in the container for subsequent requests
-
-# Copy our handler
+# Copy our serverless handler
 COPY handler.py /app/handler.py
 
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
-ENV HF_HOME=/app/cache
-ENV TRANSFORMERS_CACHE=/app/cache
-
 
 WORKDIR /app
 
-# RunPod serverless entry point
+# RunPod serverless entry point (overrides the default FastAPI server)
+CMD ["python", "-u", "handler.py"]
 CMD ["python", "-u", "handler.py"]

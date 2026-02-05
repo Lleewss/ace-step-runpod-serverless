@@ -1,11 +1,6 @@
 """
 ACE-Step 1.5 RunPod Serverless Handler
-Generates music using the ACE-Step 1.5 model
-
-Based on the official ACE-Step 1.5 API:
-- https://github.com/ace-step/ACE-Step-1.5
-- Uses AceStepHandler (DiT) + LLMHandler (5Hz LM) 
-- generate_music() function with GenerationParams and GenerationConfig
+Based on valyriantech/ace-step-1.5:latest image
 """
 
 import runpod
@@ -14,231 +9,225 @@ import sys
 import base64
 import tempfile
 import traceback
-import shutil
+import subprocess
+import glob
 
-# Add ace-step to path
-sys.path.insert(0, '/app/ace-step')
-
-# Global model instances (loaded once, reused across requests)
-dit_handler = None
-llm_handler = None
+# Global state
 is_initialized = False
+ace_step_module = None
+
+def find_ace_step():
+    """Find ACE-Step installation in the container"""
+    possible_paths = [
+        '/app',
+        '/app/ace-step',
+        '/app/ACE-Step-1.5',
+        '/workspace',
+        '/opt/ace-step',
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            # Look for key files
+            for root, dirs, files in os.walk(path):
+                if 'inference.py' in files or 'generate.py' in files:
+                    print(f"Found ACE-Step at: {root}")
+                    return root
+                if 'acestep' in dirs:
+                    print(f"Found acestep module at: {path}")
+                    return path
+    
+    return None
 
 def load_models():
-    """
-    Load ACE-Step 1.5 models using the official API.
-    
-    Uses:
-    - AceStepHandler for DiT model (acestep-v15-turbo)
-    - LLMHandler for 5Hz language model (acestep-5Hz-lm-1.7B)
-    """
-    global dit_handler, llm_handler, is_initialized
+    """Load ACE-Step models - auto-discover module structure"""
+    global is_initialized, ace_step_module
     
     if is_initialized:
-        return dit_handler, llm_handler
+        return True
     
-    print("Loading ACE-Step 1.5 models...")
+    print("Discovering ACE-Step installation...")
     
-    from acestep.handler import AceStepHandler
-    from acestep.llm_inference import LLMHandler
+    # Find ace-step path
+    ace_path = find_ace_step()
+    if ace_path:
+        sys.path.insert(0, ace_path)
+        print(f"Added {ace_path} to Python path")
     
-    # Initialize DiT handler (turbo model for fast generation)
-    dit_handler = AceStepHandler()
-    dit_handler.initialize_service(
-        project_root="/app/ace-step",
-        config_path="acestep-v15-turbo",
-        device="cuda"
+    # Try different import patterns
+    try:
+        # Pattern 1: acestep.pipeline (common structure)
+        from acestep.pipeline import ACEStepPipeline
+        print("✓ Found acestep.pipeline.ACEStepPipeline")
+        ace_step_module = "pipeline"
+        is_initialized = True
+        return True
+    except ImportError as e:
+        print(f"Pipeline import failed: {e}")
+    
+    try:
+        # Pattern 2: acestep.inference
+        from acestep import inference
+        print("✓ Found acestep.inference")
+        ace_step_module = "inference"
+        is_initialized = True
+        return True
+    except ImportError as e:
+        print(f"Inference import failed: {e}")
+    
+    try:
+        # Pattern 3: Direct import
+        import acestep
+        print(f"✓ Found acestep: {dir(acestep)}")
+        ace_step_module = "acestep"
+        is_initialized = True
+        return True
+    except ImportError as e:
+        print(f"acestep import failed: {e}")
+    
+    # Pattern 4: Check for CLI script
+    cli_paths = glob.glob('/app/**/generate*.py', recursive=True)
+    if cli_paths:
+        print(f"Found CLI scripts: {cli_paths}")
+        ace_step_module = "cli"
+        is_initialized = True
+        return True
+    
+    print("❌ Could not find ACE-Step module")
+    return False
+
+
+def generate_with_cli(caption, lyrics, duration, output_path, **kwargs):
+    """Generate music using CLI if available"""
+    cli_script = glob.glob('/app/**/generate*.py', recursive=True)
+    if not cli_script:
+        raise Exception("No CLI script found")
+    
+    cmd = [
+        'python', cli_script[0],
+        '--caption', caption,
+        '--lyrics', lyrics,
+        '--duration', str(duration),
+        '--output', output_path
+    ]
+    
+    if kwargs.get('bpm'):
+        cmd.extend(['--bpm', str(kwargs['bpm'])])
+    if kwargs.get('seed') and kwargs['seed'] != -1:
+        cmd.extend(['--seed', str(kwargs['seed'])])
+    
+    print(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    
+    if result.returncode != 0:
+        raise Exception(f"CLI failed: {result.stderr}")
+    
+    return output_path
+
+
+def generate_with_pipeline(caption, lyrics, duration, output_path, **kwargs):
+    """Generate music using ACEStepPipeline"""
+    from acestep.pipeline import ACEStepPipeline
+    
+    pipeline = ACEStepPipeline.from_pretrained(
+        "/app/checkpoints" if os.path.exists("/app/checkpoints") else "ACE-Step/ACE-Step-v1.5"
     )
-    print("✓ DiT handler initialized (acestep-v15-turbo)")
+    pipeline = pipeline.to("cuda")
     
-    # Initialize LLM handler (1.7B model for best quality with thinking mode)
-    llm_handler = LLMHandler()
-    llm_handler.initialize(
-        checkpoint_dir="/app/ace-step/checkpoints",
-        lm_model_path="acestep-5Hz-lm-1.7B",
-        backend="vllm",  # vllm is faster than PyTorch
-        device="cuda"
+    audio = pipeline(
+        prompt=caption,
+        lyrics=lyrics,
+        duration=duration,
+        num_inference_steps=kwargs.get('inference_steps', 8),
     )
-    print("✓ LLM handler initialized (acestep-5Hz-lm-1.7B)")
     
-    is_initialized = True
-    print("✅ All models loaded successfully!")
-    return dit_handler, llm_handler
+    # Save audio
+    import soundfile as sf
+    sf.write(output_path, audio.squeeze().cpu().numpy(), 44100)
+    
+    return output_path
 
 
 def handler(job):
-    """
-    RunPod serverless handler for ACE-Step 1.5
-    
-    Input parameters:
-    - caption: str - Music description/style tags (e.g., "upbeat pop song with guitar")
-    - lyrics: str - Song lyrics with [verse], [chorus], [bridge] tags
-    - duration: int - Duration in seconds (10-600, default: 120)
-    - bpm: int - Tempo in BPM (30-300, optional - auto-detected if not provided)
-    - key_scale: str - Musical key (e.g., "C Major", "Am", optional)
-    - vocal_language: str - Language for vocals (en, zh, ja, etc., default: "en")
-    - thinking: bool - Enable Chain-of-Thought for better quality (default: True)
-    - inference_steps: int - Diffusion steps (1-20, default: 8 for turbo)
-    - seed: int - Random seed (-1 for random, default: -1)
-    - use_format: bool - Let LM enhance caption/lyrics (default: False)
-    - audio_format: str - Output format: mp3, wav, flac (default: "mp3")
-    
-    Returns:
-    - audio_base64: Base64 encoded audio file
-    - duration: Actual duration of generated audio
-    - seed: Seed used for generation
-    - bpm: BPM of generated music
-    - key_scale: Key/scale of generated music
-    - model: Model identifier
-    - format: Audio format
-    """
+    """RunPod serverless handler"""
     try:
         job_input = job["input"]
         
-        # Extract parameters with sensible defaults
         caption = job_input.get("caption") or job_input.get("tags", "pop, upbeat, energetic")
         lyrics = job_input.get("lyrics", "[instrumental]")
-        duration = job_input.get("duration", 120)
-        bpm = job_input.get("bpm")  # Optional - LM will auto-detect
-        key_scale = job_input.get("key_scale", "")
-        vocal_language = job_input.get("vocal_language", "en")
-        thinking = job_input.get("thinking", job_input.get("think_mode", True))
-        inference_steps = job_input.get("inference_steps", job_input.get("steps", 8))
-        seed = job_input.get("seed", -1)
-        use_format = job_input.get("use_format", False)
-        audio_format = job_input.get("audio_format", job_input.get("format", "mp3"))
+        duration = min(600, max(10, int(job_input.get("duration", 120))))
+        audio_format = job_input.get("audio_format", "mp3")
         
-        # Validate parameters
-        duration = max(10, min(600, int(duration)))  # 10s to 10min
-        inference_steps = max(1, min(20, int(inference_steps)))  # Turbo: 1-20, recommended 8
-        if bpm is not None:
-            bpm = max(30, min(300, int(bpm)))
-        if audio_format not in ["mp3", "wav", "flac"]:
-            audio_format = "mp3"
+        kwargs = {
+            'bpm': job_input.get('bpm'),
+            'seed': job_input.get('seed', -1),
+            'inference_steps': job_input.get('inference_steps', 8),
+            'thinking': job_input.get('thinking', True),
+        }
         
-        print(f"🎵 Generating song:")
-        print(f"   Duration: {duration}s, Steps: {inference_steps}, Thinking: {thinking}")
+        print(f"🎵 Generating: duration={duration}s, format={audio_format}")
         print(f"   Caption: {caption[:100]}...")
-        print(f"   Lyrics: {lyrics[:100]}...")
         
         # Load models
-        dit, llm = load_models()
+        if not load_models():
+            raise Exception("Failed to load ACE-Step models")
         
-        # Import generation functions
-        from acestep.inference import GenerationParams, GenerationConfig, generate_music
-        
-        # Create generation parameters
-        params = GenerationParams(
-            task_type="text2music",
-            caption=caption,
-            lyrics=lyrics,
-            duration=duration,
-            bpm=bpm,
-            keyscale=key_scale,
-            vocal_language=vocal_language,
-            inference_steps=inference_steps,
-            shift=3.0,  # Recommended for turbo model
-            thinking=thinking,
-            use_format=use_format,
-        )
-        
-        # Handle seed
-        use_random_seed = (seed == -1)
-        
-        # Create generation config
-        config = GenerationConfig(
-            batch_size=1,  # Generate 1 audio at a time for serverless
-            audio_format=audio_format,
-            use_random_seed=use_random_seed,
-        )
-        
-        # If specific seed requested
-        if not use_random_seed:
-            params.seed = seed
-        
-        # Create temp directory for output
-        save_dir = tempfile.mkdtemp(prefix="acestep_")
+        # Create temp output
+        output_dir = tempfile.mkdtemp(prefix="acestep_")
+        output_path = os.path.join(output_dir, f"output.{audio_format}")
         
         try:
-            # Generate music using official API
-            result = generate_music(dit, llm, params, config, save_dir)
+            # Generate based on discovered module
+            if ace_step_module == "pipeline":
+                generate_with_pipeline(caption, lyrics, duration, output_path, **kwargs)
+            elif ace_step_module == "cli":
+                generate_with_cli(caption, lyrics, duration, output_path, **kwargs)
+            else:
+                # Try pipeline first, then CLI
+                try:
+                    generate_with_pipeline(caption, lyrics, duration, output_path, **kwargs)
+                except Exception as e:
+                    print(f"Pipeline failed, trying CLI: {e}")
+                    generate_with_cli(caption, lyrics, duration, output_path, **kwargs)
             
-            if not result.success:
-                raise Exception(f"Generation failed: {result.error if hasattr(result, 'error') else 'Unknown error'}")
+            # Check if file was created
+            if not os.path.exists(output_path):
+                # Try wav extension
+                output_path = os.path.join(output_dir, "output.wav")
+                if not os.path.exists(output_path):
+                    raise Exception(f"Output file not created")
             
-            # Get the generated audio file
-            if not result.audios or len(result.audios) == 0:
-                raise Exception("No audio files generated")
-            
-            audio_info = result.audios[0]
-            audio_path = audio_info.get("path")
-            actual_seed = audio_info.get("params", {}).get("seed", seed)
-            
-            if not audio_path or not os.path.exists(audio_path):
-                raise Exception(f"Audio file not found at: {audio_path}")
-            
-            print(f"✓ Audio generated: {audio_path}")
-            
-            # Read and encode audio
-            with open(audio_path, "rb") as f:
+            # Read and encode
+            with open(output_path, "rb") as f:
                 audio_base64 = base64.b64encode(f.read()).decode("utf-8")
             
-            # Extract metadata from result if available
-            result_bpm = bpm
-            result_keyscale = key_scale
-            if hasattr(result, 'metas') and result.metas:
-                result_bpm = result.metas.get('bpm', bpm)
-                result_keyscale = result.metas.get('keyscale', key_scale)
+            print(f"✅ Generated {os.path.getsize(output_path)} bytes")
             
             return {
                 "audio_base64": audio_base64,
                 "duration": duration,
-                "seed": actual_seed,
-                "bpm": result_bpm,
-                "key_scale": result_keyscale,
-                "model": "ace-step-1.5-turbo",
+                "seed": kwargs.get('seed', -1),
+                "model": "ace-step-1.5",
                 "format": audio_format
             }
             
         finally:
-            # Clean up temp directory
+            # Cleanup
             try:
-                shutil.rmtree(save_dir)
-            except Exception as e:
-                print(f"Warning: Failed to clean up temp dir: {e}")
-        
+                import shutil
+                shutil.rmtree(output_dir)
+            except:
+                pass
+                
     except Exception as e:
         traceback.print_exc()
         return {"error": str(e)}
 
 
-# For local testing: python handler.py --test
-# For RunPod: the entrypoint runs this file directly
+# Start RunPod serverless worker
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "--test":
-        # Test locally without RunPod
-        test_input = {
-            "input": {
-                "caption": "acoustic pop, romantic ballad, piano, strings, warm, heartfelt, female vocals",
-                "lyrics": "[verse]\nFrom the moment that I saw your face\nI knew my heart had found its place\n\n[chorus]\nThis is where our story starts\nYou will always have my heart",
-                "duration": 60,
-                "bpm": 95,
-                "thinking": True,
-                "inference_steps": 8
-            }
-        }
-        
-        result = handler(test_input)
-        if "error" in result:
-            print(f"❌ Error: {result['error']}")
-        else:
-            print(f"✅ Success! Generated {result['duration']}s audio")
-            print(f"   Seed: {result['seed']}, BPM: {result['bpm']}, Format: {result['format']}")
-            # Save test output
-            with open("test_output.mp3", "wb") as f:
-                f.write(base64.b64decode(result["audio_base64"]))
-            print("Saved to test_output.mp3")
-    else:
-        # RunPod serverless mode
-        runpod.serverless.start({"handler": handler})
+    print("Starting ACE-Step 1.5 RunPod Serverless Worker...")
+    print(f"Python path: {sys.path}")
+    print(f"Working directory: {os.getcwd()}")
+    print(f"Contents of /app: {os.listdir('/app') if os.path.exists('/app') else 'N/A'}")
+    runpod.serverless.start({"handler": handler})
