@@ -3,9 +3,22 @@ ACE-Step 1.5 RunPod Serverless Handler
 Based on valyriantech/ace-step-1.5:latest image
 """
 
-import runpod
 import os
 import sys
+
+# CRITICAL: Set environment variables BEFORE importing anything else
+# This disables flash-attn and uses PyTorch's SDPA instead
+os.environ['ATTN_BACKEND'] = 'sdpa'
+os.environ['USE_FLASH_ATTN'] = '0'
+os.environ['DIFFUSERS_ATTN_IMPLEMENTATION'] = 'sdpa'
+os.environ['TORCH_SDPA_ENABLED'] = '1'
+
+# Block flash_attn from being imported
+sys.modules['flash_attn'] = None
+sys.modules['flash_attn_2_cuda'] = None
+sys.modules['flash_attn.flash_attn_interface'] = None
+
+import runpod
 import base64
 import tempfile
 import traceback
